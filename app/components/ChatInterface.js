@@ -8,7 +8,7 @@ export default function ChatInterface() {
   const [messages, setMessages] = useState([
     { 
       id: 1, 
-      text: "Hello! I'm your AI-powered reporting assistant. I use Claude AI to understand your questions and query your Supabase database.\n\nTry asking me complex questions like:\n\n• How many inquiries did we get last week grouped by source?\n• Show me all won deals this month by agent\n• What's the status distribution for inquiries?\n• List agents who joined in the last 30 days\n• Show me lost inquiries with their reasons", 
+      text: "Hello! I'm your AI-powered reporting assistant. I use Claude AI to understand your questions and query your Supabase database.\n\n⚠️ Note: Your data appears to be from June 2025, so queries for 'last week' (July 2025) may return no results.\n\nTry these queries:\n\n• Show me inquiries from June 2025 grouped by source\n• Show all lost inquiries with their reasons\n• What's the status distribution for all inquiries?\n• Show me won deals from June 2025\n• List the most recent 20 inquiries", 
       sender: 'bot' 
     }
   ])
@@ -41,7 +41,8 @@ export default function ChatInterface() {
           data: result.data,
           rawData: result.rawData,
           intent: result.intent,
-          query: input
+          query: input,
+          debug: result.debug // Add debug info
         }
         setMessages(prev => [...prev, botMessage])
       } else {
@@ -51,7 +52,7 @@ export default function ChatInterface() {
       const errorMessage = {
         id: Date.now() + 1,
         sender: 'bot',
-        text: `Error: ${error.message}. Please make sure your Claude API key is set in the environment variables.`
+        text: `Error: ${error.message}\n\nTip: If you're looking for data from June 2025, try queries like "Show me inquiries from June 2025" since that's when your data is from.`
       }
       setMessages(prev => [...prev, errorMessage])
     } finally {

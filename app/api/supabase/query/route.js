@@ -10,12 +10,16 @@ export async function POST(request) {
   try {
     const { query } = await request.json()
     
-    console.log('Received query:', query)
+    console.log('API Route - Received query:', query)
+    console.log('Environment check:', {
+      hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
+      keyLength: process.env.ANTHROPIC_API_KEY?.length || 0
+    })
     
     // Use Claude to parse the query
     const queryIntent = await parseQueryWithClaude(query)
     
-    console.log('Query intent from Claude:', JSON.stringify(queryIntent, null, 2))
+    console.log('API Route - Query intent:', JSON.stringify(queryIntent, null, 2))
     
     // Build Supabase query
     let supabaseQuery = supabase.from(queryIntent.table)
@@ -112,62 +116,31 @@ export async function POST(request) {
       data: processedData,
       rawData: data,
       intent: queryIntent,
-      count: data ? data.length : 0
+      count: data ? data.length : 0,
+      debug: {
+        totalRecords: data ? data.length : 0,
+        queryUsed: queryIntent,
+        timestamp: new Date().toISOString()
+      }
     })
     
   } catch (error) {
     console.error('API Error:', error)
     return NextResponse.json(
-      { success: false, error: error.message },
+      { 
+        success: false, 
+        error: error.message,
+        debug: {
+          errorType: error.constructor.name,
+          timestamp: new Date().toISOString()
+        }
+      },
       { status: 500 }
     )
   }
 }
 
-async function parseQueryWithClaude(userQuery) {
-  const today = new Date()
-  const todayStr = today.toISOString().split('T')[0]
-  
-  const prompt = `You are a SQL query expert for a Supabase database. Convert this natural language query into parameters for Supabase JavaScript client.
-
-Database schema:
-1. agents table:
-   - agents_id (text, primary key)
-   - first_name (text)
-   - last_name (text)
-   - email_address (text)
-   - whatsapp_number_supabase (text)
-   - years_of_experience (integer)
-   - sign_up_timestamp (date)
-   - sales_team_agency_supabase (text)
-   - agency_name_supabase (text)
-
-2. inquiries table:
-   - inquiry_id (text, primary key)
-   - agent_id (text, foreign key to agents.agents_id)
-   - property_id (text)
-   - inquiry_created_ts (timestamp without time zone)
-   - source (text)
-   - status (text)
-   - lost_reason (text)
-   - ts_contacted (timestamp without time zone)
-   - ts_lost_reason (timestamp without time zone)
-   - ts_won (timestamp without time zone)
-   - new_viewings (text)
-
-Current date and time: ${today.toISOString()}
-Today's date: ${todayStr}
-
-User query: "${userQuery}"
-
-Respond with ONLY a valid JSON object with this structure:
-{
-  "table": "inquiries" or "agents",
-  "select": "columns to select (use * for all, or specify columns. For joins use syntax like '*,agents(first_name,last_name)')",
-  "filters": [
-    {
-      "column": "column_name",
-      "operator": "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "like" | "ilike" | "in" | "is",
+is",
       "value": "value (for dates use ISO format YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"
     }
   ],
@@ -248,6 +221,7 @@ function basicParseQuery(query) {
   // Determine table
   if (lowerQuery.includes('agent') && !lowerQuery.includes('inquir') && !lowerQuery.includes('by agent')) {
     intent.table = 'agents'
+    intent.order.column = 'sign_up_timestamp'
   }
   
   // Date filtering
@@ -256,17 +230,57 @@ function basicParseQuery(query) {
     lastWeek.setDate(today.getDate() - 7)
     lastWeek.setHours(0, 0, 0, 0)
     
+    const dateColumn = intent.table === 'agents' ? 'sign_up_timestamp' : 'inquiry_created_ts'
+    
     intent.filters.push({
-      column: 'inquiry_created_ts',
+      column: dateColumn,
       operator: 'gte',
       value: lastWeek.toISOString()
     })
     intent.filters.push({
-      column: 'inquiry_created_ts',
+      column: dateColumn,
       operator: 'lte',
       value: today.toISOString()
     })
-    intent.explanation = `Showing inquiries from the last 7 days (${lastWeek.toLocaleDateString()} to ${today.toLocaleDateString()})`
+    intent.explanation = `Showing ${intent.table} from the last 7 days (${lastWeek.toLocaleDateString()} to ${today.toLocaleDateString()}) - using fallback parser`
+  } else if (lowerQuery.includes('this month')) {
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1)
+    const dateColumn = intent.table === 'agents' ? 'sign_up_timestamp' : 'inquiry_created_ts'
+    
+    intent.filters.push({
+      column: dateColumn,
+      operator: 'gte',
+      value: monthStart.toISOString()
+    })
+    intent.explanation = `Showing ${intent.table} from this month - using fallback parser`
+  } else if (lowerQuery.includes('last 30 days')) {
+    const thirtyDaysAgo = new Date(today)
+    thirtyDaysAgo.setDate(today.getDate() - 30)
+    const dateColumn = intent.table === 'agents' ? 'sign_up_timestamp' : 'inquiry_created_ts'
+    
+    intent.filters.push({
+      column: dateColumn,
+      operator: 'gte',
+      value: thirtyDaysAgo.toISOString()
+    })
+    intent.explanation = `Showing ${intent.table} from the last 30 days - using fallback parser`
+  }
+  
+  // Status filtering
+  if (lowerQuery.includes('won deal') || lowerQuery.includes('won inquir')) {
+    intent.filters.push({
+      column: 'status',
+      operator: 'eq',
+      value: 'Won'
+    })
+    intent.explanation += ' (Won status only)'
+  } else if (lowerQuery.includes('lost')) {
+    intent.filters.push({
+      column: 'status',
+      operator: 'eq',
+      value: 'Lost'
+    })
+    intent.explanation += ' (Lost status only)'
   }
   
   // Grouping
@@ -276,12 +290,16 @@ function basicParseQuery(query) {
   } else if (lowerQuery.includes('by status')) {
     intent.groupBy = 'status'
     intent.visualization = 'bar'
+  } else if (lowerQuery.includes('by agent')) {
+    intent.select = '*,agents(first_name,last_name)'
+    intent.groupBy = 'agent_id'
+    intent.visualization = 'bar'
   }
   
   // Recent/Last inquiries
   if (lowerQuery.includes('last inquiries') || lowerQuery.includes('recent inquiries')) {
     intent.limit = 20
-    intent.explanation = 'Showing the most recent inquiries'
+    intent.explanation = 'Showing the 20 most recent inquiries - using fallback parser'
   }
   
   return intent
