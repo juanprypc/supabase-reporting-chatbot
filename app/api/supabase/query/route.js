@@ -140,7 +140,50 @@ export async function POST(request) {
   }
 }
 
-is",
+async function parseQueryWithClaude(userQuery) {
+  const today = new Date()
+  const todayStr = today.toISOString().split('T')[0]
+  
+  const prompt = `You are a SQL query expert for a Supabase database. Convert this natural language query into parameters for Supabase JavaScript client.
+
+Database schema:
+1. agents table:
+   - agents_id (text, primary key)
+   - first_name (text)
+   - last_name (text)
+   - email_address (text)
+   - whatsapp_number_supabase (text)
+   - years_of_experience (integer)
+   - sign_up_timestamp (date)
+   - sales_team_agency_supabase (text)
+   - agency_name_supabase (text)
+
+2. inquiries table:
+   - inquiry_id (text, primary key)
+   - agent_id (text, foreign key to agents.agents_id)
+   - property_id (text)
+   - inquiry_created_ts (timestamp without time zone)
+   - source (text)
+   - status (text)
+   - lost_reason (text)
+   - ts_contacted (timestamp without time zone)
+   - ts_lost_reason (timestamp without time zone)
+   - ts_won (timestamp without time zone)
+   - new_viewings (text)
+
+Current date and time: ${today.toISOString()}
+Today's date: ${todayStr}
+
+User query: "${userQuery}"
+
+Respond with ONLY a valid JSON object with this structure:
+{
+  "table": "inquiries" or "agents",
+  "select": "columns to select (use * for all, or specify columns. For joins use syntax like '*,agents(first_name,last_name)')",
+  "filters": [
+    {
+      "column": "column_name",
+      "operator": "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "like" | "ilike" | "in" | "is",
       "value": "value (for dates use ISO format YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"
     }
   ],
