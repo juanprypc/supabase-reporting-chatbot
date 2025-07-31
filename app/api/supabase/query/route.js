@@ -10,8 +10,12 @@ export async function POST(request) {
   try {
     const { query } = await request.json()
     
+    console.log('Received query:', query)
+    
     // Use Claude to parse the query
     const queryIntent = await parseQueryWithClaude(query)
+    
+    console.log('Query intent from Claude:', JSON.stringify(queryIntent, null, 2))
     
     // Build Supabase query
     let supabaseQuery = supabase.from(queryIntent.table)
@@ -22,9 +26,45 @@ export async function POST(request) {
     }
     
     // Apply filters
-    if (queryIntent.filters) {
+    if (queryIntent.filters && queryIntent.filters.length > 0) {
       queryIntent.filters.forEach(filter => {
-        supabaseQuery = supabaseQuery[filter.operator](filter.column, filter.value)
+        console.log(`Applying filter: ${filter.column} ${filter.operator} ${filter.value}`)
+        
+        // Handle different operators
+        switch(filter.operator) {
+          case 'eq':
+            supabaseQuery = supabaseQuery.eq(filter.column, filter.value)
+            break
+          case 'neq':
+            supabaseQuery = supabaseQuery.neq(filter.column, filter.value)
+            break
+          case 'gt':
+            supabaseQuery = supabaseQuery.gt(filter.column, filter.value)
+            break
+          case 'gte':
+            supabaseQuery = supabaseQuery.gte(filter.column, filter.value)
+            break
+          case 'lt':
+            supabaseQuery = supabaseQuery.lt(filter.column, filter.value)
+            break
+          case 'lte':
+            supabaseQuery = supabaseQuery.lte(filter.column, filter.value)
+            break
+          case 'like':
+            supabaseQuery = supabaseQuery.like(filter.column, filter.value)
+            break
+          case 'ilike':
+            supabaseQuery = supabaseQuery.ilike(filter.column, filter.value)
+            break
+          case 'in':
+            supabaseQuery = supabaseQuery.in(filter.column, filter.value)
+            break
+          case 'is':
+            supabaseQuery = supabaseQuery.is(filter.column, filter.value)
+            break
+          default:
+            console.warn(`Unknown operator: ${filter.operator}`)
+        }
       })
     }
     
@@ -44,12 +84,15 @@ export async function POST(request) {
     const { data, error } = await supabaseQuery
     
     if (error) {
+      console.error('Supabase error:', error)
       throw error
     }
     
+    console.log(`Query returned ${data ? data.length : 0} records`)
+    
     // Post-process data for grouping
     let processedData = data
-    if (queryIntent.groupBy && data.length > 0) {
+    if (queryIntent.groupBy && data && data.length > 0) {
       const grouped = {}
       data.forEach(item => {
         let key = item[queryIntent.groupBy] || 'Unknown'
@@ -69,7 +112,7 @@ export async function POST(request) {
       data: processedData,
       rawData: data,
       intent: queryIntent,
-      count: data.length
+      count: data ? data.length : 0
     })
     
   } catch (error) {
@@ -82,7 +125,8 @@ export async function POST(request) {
 }
 
 async function parseQueryWithClaude(userQuery) {
-  const today = new Date().toISOString().split('T')[0]
+  const today = new Date()
+  const todayStr = today.toISOString().split('T')[0]
   
   const prompt = `You are a SQL query expert for a Supabase database. Convert this natural language query into parameters for Supabase JavaScript client.
 
@@ -102,15 +146,17 @@ Database schema:
    - inquiry_id (text, primary key)
    - agent_id (text, foreign key to agents.agents_id)
    - property_id (text)
-   - inquiry_created_ts (timestamp)
+   - inquiry_created_ts (timestamp without time zone)
    - source (text)
    - status (text)
    - lost_reason (text)
-   - ts_contacted (timestamp)
-   - ts_lost_reason (timestamp)
-   - ts_won (timestamp)
+   - ts_contacted (timestamp without time zone)
+   - ts_lost_reason (timestamp without time zone)
+   - ts_won (timestamp without time zone)
+   - new_viewings (text)
 
-Today's date: ${today}
+Current date and time: ${today.toISOString()}
+Today's date: ${todayStr}
 
 User query: "${userQuery}"
 
@@ -121,8 +167,8 @@ Respond with ONLY a valid JSON object with this structure:
   "filters": [
     {
       "column": "column_name",
-      "operator": "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "like" | "ilike" | "in",
-      "value": "value"
+      "operator": "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "like" | "ilike" | "in" | "is",
+      "value": "value (for dates use ISO format YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"
     }
   ],
   "order": {
@@ -130,24 +176,30 @@ Respond with ONLY a valid JSON object with this structure:
     "ascending": true | false
   },
   "limit": number or null,
-  "groupBy": "column_name" or null,
+  "groupBy": "column_name" or null (use this for grouping by source, status, agent_id, etc),
   "visualization": "table" | "bar" | "pie" | "line" | "metric",
   "explanation": "Human-readable explanation of what this query does"
 }
 
-Guidelines:
-- For date ranges, use gte and lte filters on inquiry_created_ts
-- "last week" means the past 7 days from today
-- "this month" means from the 1st of current month
-- For grouping queries (by source, by status, by agent), set groupBy field
+Important guidelines:
+- For "last week", calculate dates from 7 days ago until today
+- For "this month", use from the 1st of current month
+- For "last month", use the previous month's date range
+- Always use ISO format for dates: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
+- For grouping queries (by source, by status, by agent), set groupBy field AND select all columns
 - For joins with agents table, use select: "*,agents(first_name,last_name)"
-- Status values are typically: "Won", "Lost", "Pending", etc.
+- Common status values: "Won", "Lost", "Pending", "New", "Contacted"
+- Common sources: "PRYPCO One", "Website", "Referral", etc.
+- For "last inquiries" or "recent inquiries", order by inquiry_created_ts descending with a limit of 20-50
 - Choose appropriate visualization based on query type
-- For counting queries, use visualization: "metric"
 
 RESPOND ONLY WITH VALID JSON, NO ADDITIONAL TEXT.`
 
   try {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      throw new Error('ANTHROPIC_API_KEY not found in environment variables')
+    }
+    
     const message = await anthropic.messages.create({
       model: 'claude-3-sonnet-20240229',
       max_tokens: 1000,
@@ -160,12 +212,18 @@ RESPOND ONLY WITH VALID JSON, NO ADDITIONAL TEXT.`
       ]
     })
     
-    const responseText = message.content[0].text
-    const queryIntent = JSON.parse(responseText)
+    const responseText = message.content[0].text.trim()
+    console.log('Claude response:', responseText)
+    
+    // Clean the response in case it has markdown
+    const cleanedResponse = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
+    
+    const queryIntent = JSON.parse(cleanedResponse)
     
     return queryIntent
   } catch (error) {
     console.error('Claude API Error:', error)
+    console.error('Falling back to basic parser')
     // Fallback to basic parsing if Claude fails
     return basicParseQuery(userQuery)
   }
@@ -179,24 +237,51 @@ function basicParseQuery(query) {
     table: 'inquiries',
     select: '*',
     filters: [],
+    order: {
+      column: 'inquiry_created_ts',
+      ascending: false
+    },
     visualization: 'table',
-    explanation: 'Showing data based on your query'
+    explanation: 'Showing data based on your query (using fallback parser)'
   }
   
   // Determine table
-  if (lowerQuery.includes('agent') && !lowerQuery.includes('inquir')) {
+  if (lowerQuery.includes('agent') && !lowerQuery.includes('inquir') && !lowerQuery.includes('by agent')) {
     intent.table = 'agents'
   }
   
-  // Basic date filtering
-  if (lowerQuery.includes('last week')) {
-    const lastWeek = new Date()
+  // Date filtering
+  if (lowerQuery.includes('last week') || lowerQuery.includes('past week')) {
+    const lastWeek = new Date(today)
     lastWeek.setDate(today.getDate() - 7)
+    lastWeek.setHours(0, 0, 0, 0)
+    
     intent.filters.push({
       column: 'inquiry_created_ts',
       operator: 'gte',
       value: lastWeek.toISOString()
     })
+    intent.filters.push({
+      column: 'inquiry_created_ts',
+      operator: 'lte',
+      value: today.toISOString()
+    })
+    intent.explanation = `Showing inquiries from the last 7 days (${lastWeek.toLocaleDateString()} to ${today.toLocaleDateString()})`
+  }
+  
+  // Grouping
+  if (lowerQuery.includes('by source') || lowerQuery.includes('grouped by source')) {
+    intent.groupBy = 'source'
+    intent.visualization = 'bar'
+  } else if (lowerQuery.includes('by status')) {
+    intent.groupBy = 'status'
+    intent.visualization = 'bar'
+  }
+  
+  // Recent/Last inquiries
+  if (lowerQuery.includes('last inquiries') || lowerQuery.includes('recent inquiries')) {
+    intent.limit = 20
+    intent.explanation = 'Showing the most recent inquiries'
   }
   
   return intent
