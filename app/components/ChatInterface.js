@@ -1,149 +1,188 @@
-'use client'
+'use client';
 
-import { useState } from 'react'
-import { Send, BarChart3, Save } from 'lucide-react'
-import { MessageList } from './MessageList'
+import { useState } from 'react';
+import { Send, BarChart3, Save } from 'lucide-react';
+import { MessageList } from './MessageList';
 
 export default function ChatInterface() {
+  // initial bot greeting
   const [messages, setMessages] = useState([
-    { 
-      id: 1, 
-      text: "Hello! I'm your AI-powered reporting assistant. I use Claude AI to understand your questions and query your Supabase database.\n\n⚠️ Note: Your data appears to be from June 2025, so queries for 'last week' (July 2025) may return no results.\n\nTry these queries:\n\n• Show me inquiries from June 2025 grouped by source\n• Show all lost inquiries with their reasons\n• What's the status distribution for all inquiries?\n• Show me won deals from June 2025\n• List the most recent 20 inquiries", 
-      sender: 'bot' 
+    {
+      id: 1,
+      sender: 'bot',
+      text:
+        "Hi! I'm your GPT‑4‑powered reporting assistant connected to Supabase.\n\n" +
+        "You can ask natural‑language questions and even advanced data‑science queries " +
+        "using window functions, joins, CTEs, etc.\n\n" +
+        "Tip ▶   To inject variables, add a line such as  <PROPERTY_ID>=PROP‑25‑00813  " +
+        "before your question.\n\n" +
+        "Example prompts:\n" +
+        "• Which agents closed the most won deals this month?\n" +
+        "• Show rolling 7‑day win‑rate trend\n" +
+        "• <PROPERTY_ID>=PROP‑25‑123  Flag idle inquiries > 10 days"
     }
-  ])
-  const [input, setInput] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [savedQueries, setSavedQueries] = useState([])
+  ]);
 
-  const handleSendMessage = async () => {
-    if (!input.trim()) return
+  // UI state
+  const [query, setQuery] = useState('');
+  const [parameters, setParameters] = useState('');       // new
+  const [loading, setLoading] = useState(false);
+  const [savedQueries, setSavedQueries] = useState([]);
 
-    const userMessage = { id: Date.now(), text: input, sender: 'user' }
-    setMessages(prev => [...prev, userMessage])
-    setInput('')
-    setLoading(true)
+  /* ------------------------- interaction ------------------------- */
+  const send = async () => {
+    if (!query.trim()) return;
+
+    const userMsg = {
+      id: Date.now(),
+      sender: 'user',
+      text: parameters ? `${parameters}\n${query}` : query
+    };
+    setMessages(prev => [...prev, userMsg]);
+    setQuery('');
+    setLoading(true);
 
     try {
-      const response = await fetch('/api/supabase/query', {
+      const res = await fetch('/api/supabase/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query: input })
-      })
+        body: JSON.stringify({ query, parameters })
+      });
+      const result = await res.json();
 
-      const result = await response.json()
+      if (!result.success) throw new Error(result.error);
 
-      if (result.success) {
-        const botMessage = {
-          id: Date.now() + 1,
-          sender: 'bot',
-          text: result.intent.explanation || `Found ${result.count} records`,
-          data: result.data,
-          rawData: result.rawData,
-          intent: result.intent,
-          query: input,
-          debug: result.debug // Add debug info
-        }
-        setMessages(prev => [...prev, botMessage])
-      } else {
-        throw new Error(result.error)
-      }
-    } catch (error) {
-      const errorMessage = {
+      const botMsg = {
         id: Date.now() + 1,
         sender: 'bot',
-        text: `Error: ${error.message}\n\nTip: If you're looking for data from June 2025, try queries like "Show me inquiries from June 2025" since that's when your data is from.`
-      }
-      setMessages(prev => [...prev, errorMessage])
+        text: result.intent.explanation || `Found ${result.count} records`,
+        data: result.data,
+        rawData: result.rawData,
+        intent: result.intent,
+        query: parameters ? `${parameters}\n${query}` : query,
+        debug: result.debug
+      };
+      setMessages(prev => [...prev, botMsg]);
+    } catch (err) {
+      setMessages(prev => [
+        ...prev,
+        {
+          id: Date.now() + 1,
+          sender: 'bot',
+          text: `❌ ${err.message}`
+        }
+      ]);
     } finally {
-      setLoading(false)
+      setLoading(false);
+      setParameters('');               // reset parameters after send
     }
-  }
+  };
 
-  const saveQuery = (message) => {
-    const savedQuery = {
-      id: Date.now(),
-      query: message.query,
-      title: message.query.length > 50 ? `${message.query.substring(0, 50)}...` : message.query,
-      data: message.data,
-      rawData: message.rawData,
-      intent: message.intent,
-      timestamp: new Date().toISOString()
-    }
-    setSavedQueries(prev => [...prev, savedQuery])
-  }
+  const saveQuery = message => {
+    setSavedQueries(prev => [
+      ...prev,
+      {
+        id: Date.now(),
+        query: message.query,
+        title:
+          message.query.length > 60
+            ? `${message.query.slice(0, 60)}…`
+            : message.query,
+        data: message.data,
+        rawData: message.rawData,
+        intent: message.intent,
+        timestamp: new Date().toISOString()
+      }
+    ]);
+  };
 
+  /* ----------------------------- UI ----------------------------- */
   return (
     <div className="flex h-screen bg-gray-50">
+      {/* ------------- Main column ------------- */}
       <div className="flex-1 flex flex-col">
-        <div className="bg-white shadow-sm border-b">
-          <div className="px-6 py-4">
-            <h1 className="text-2xl font-bold text-gray-800 flex items-center gap-2">
-              <BarChart3 className="w-6 h-6 text-blue-600" />
-              AI-Powered Reporting Assistant
-            </h1>
-            <p className="text-sm text-gray-600 mt-1">Powered by Claude AI and Supabase</p>
-          </div>
-        </div>
+        <header className="bg-white shadow-sm border-b px-6 py-4">
+          <h1 className="text-2xl font-bold text-gray-800 flex items-center gap-2">
+            <BarChart3 className="w-6 h-6 text-blue-600" />
+            AI Reporting Assistant
+          </h1>
+          <p className="text-sm text-gray-600">
+            Powered by GPT‑4o & Supabase
+          </p>
+        </header>
 
         <MessageList messages={messages} onSaveQuery={saveQuery} />
 
         {loading && (
           <div className="px-6">
             <div className="bg-white rounded-lg shadow-md p-4 inline-flex items-center gap-2">
-              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600"></div>
-              <p className="text-gray-600">Claude is analyzing your query...</p>
+              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-blue-600" />
+              <p className="text-gray-600">Thinking…</p>
             </div>
           </div>
         )}
 
-        <div className="bg-white border-t p-4">
-          <div className="flex gap-2 max-w-4xl mx-auto">
+        {/* ----------- Input area ----------- */}
+        <footer className="bg-white border-t p-4">
+          <div className="flex flex-col gap-3 max-w-4xl mx-auto">
             <input
               type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
-              placeholder="Ask anything about your data in natural language..."
-              className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              value={parameters}
+              onChange={e => setParameters(e.target.value)}
+              placeholder="Optional parameters e.g. <PROPERTY_ID>=PROP‑25‑00111"
+              className="px-4 py-2 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-1 focus:ring-blue-400"
             />
-            <button
-              onClick={handleSendMessage}
-              disabled={loading}
-              className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-            >
-              <Send className="w-4 h-4" />
-              Send
-            </button>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && send()}
+                placeholder="Ask anything about your data…"
+                className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <button
+                onClick={send}
+                disabled={loading}
+                className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
+              >
+                <Send className="w-4 h-4" />
+                Send
+              </button>
+            </div>
           </div>
-        </div>
+        </footer>
       </div>
 
-      <div className="w-80 bg-white border-l overflow-y-auto">
-        <div className="p-4 border-b">
-          <h2 className="text-lg font-semibold text-gray-800 flex items-center gap-2">
-            <Save className="w-5 h-5" />
-            Saved Queries
-          </h2>
+      {/* ------------- Saved queries panel ------------- */}
+      <aside className="w-80 bg-white border-l overflow-y-auto">
+        <div className="p-4 border-b flex items-center gap-2">
+          <Save className="w-5 h-5" />
+          <h2 className="text-lg font-semibold text-gray-800">Saved Queries</h2>
         </div>
         <div className="p-4 space-y-3">
           {savedQueries.length === 0 ? (
-            <p className="text-gray-500 text-sm">No saved queries yet. Save your favorite queries to build a custom dashboard!</p>
+            <p className="text-gray-500 text-sm">
+              No saved queries yet. Pin your favourites to build dashboards 🚀
+            </p>
           ) : (
-            savedQueries.map(query => (
-              <div key={query.id} className="bg-gray-50 rounded-lg p-3 border border-gray-200">
-                <h3 className="font-medium text-sm text-gray-800 mb-1">{query.title}</h3>
+            savedQueries.map(q => (
+              <div
+                key={q.id}
+                className="bg-gray-50 rounded-lg p-3 border border-gray-200"
+              >
+                <h3 className="font-medium text-sm text-gray-800 mb-1">
+                  {q.title}
+                </h3>
                 <p className="text-xs text-gray-500 mb-2">
-                  {new Date(query.timestamp).toLocaleString()}
+                  {new Date(q.timestamp).toLocaleString()}
                 </p>
-                <p className="text-xs text-gray-600">
-                  {query.intent.explanation}
-                </p>
+                <p className="text-xs text-gray-600">{q.intent.explanation}</p>
               </div>
             ))
           )}
         </div>
-      </div>
+      </aside>
     </div>
-  )
+  );
 }
