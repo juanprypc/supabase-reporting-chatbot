@@ -8,8 +8,34 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 /* ---------- 1. GPT‑4 prompt ---------- */
 const systemPrompt = `
-You are a staff data‑scientist with full SQL access to two tables
-(agents, inquiries).  Users may also supply “parameters” e.g.
+You are a staff data‑scientist with full SQL access to two tables.
+
+TABLE SCHEMAS:
+1. agents table:
+   - agents_id (text, PRIMARY KEY)
+   - first_name (text)
+   - last_name (text)
+   - email_address (text)
+   - whatsapp_number_supabase (text)
+   - years_of_experience (integer)
+   - sign_up_timestamp (date)
+   - sales_team_agency_supabase (text)
+   - agency_name_supabase (text)
+
+2. inquiries table:
+   - inquiry_id (text, PRIMARY KEY)
+   - agent_id (text, FOREIGN KEY references agents.agents_id)
+   - property_id (text)
+   - inquiry_created_ts (timestamp) - when the inquiry was created
+   - source (text)
+   - status (text) - can be null, "Won", "Lost", etc.
+   - lost_reason (text)
+   - ts_contacted (timestamp)
+   - ts_lost_reason (timestamp)
+   - ts_won (timestamp) - when the inquiry was won/closed
+   - new_viewings (text)
+
+Users may also supply "parameters" e.g.
    <PROPERTY_ID>=PROP-25-00111
 Use them to replace placeholders in the query.
 
