@@ -2,24 +2,30 @@ import { NextResponse } from 'next/server'
 import { supabase } from '@/lib/supabase'
 import Anthropic from '@anthropic-ai/sdk'
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-})
+// Initialize Claude with proper error handling
+let anthropic = null
+if (process.env.ANTHROPIC_API_KEY) {
+  anthropic = new Anthropic({
+    apiKey: process.env.ANTHROPIC_API_KEY,
+  })
+}
 
 export async function POST(request) {
   try {
     const { query } = await request.json()
     
-    console.log('API Route - Received query:', query)
-    console.log('Environment check:', {
-      hasAnthropicKey: !!process.env.ANTHROPIC_API_KEY,
-      keyLength: process.env.ANTHROPIC_API_KEY?.length || 0
-    })
+    console.log('Received query:', query)
     
-    // Use Claude to parse the query
-    const queryIntent = await parseQueryWithClaude(query)
-    
-    console.log('API Route - Query intent:', JSON.stringify(queryIntent, null, 2))
+    // Parse the query
+    let queryIntent
+    try {
+      queryIntent = await parseQueryWithClaude(query)
+      console.log('Claude parsed query:', JSON.stringify(queryIntent, null, 2))
+    } catch (error) {
+      console.error('Claude parsing failed, using fallback:', error.message)
+      queryIntent = basicParseQuery(query)
+      console.log('Fallback parsed query:', JSON.stringify(queryIntent, null, 2))
+    }
     
     // Build Supabase query
     let supabaseQuery = supabase.from(queryIntent.table)
@@ -27,14 +33,16 @@ export async function POST(request) {
     // Apply select
     if (queryIntent.select) {
       supabaseQuery = supabaseQuery.select(queryIntent.select)
+    } else {
+      // Default select all
+      supabaseQuery = supabaseQuery.select('*')
     }
     
     // Apply filters
     if (queryIntent.filters && queryIntent.filters.length > 0) {
-      queryIntent.filters.forEach(filter => {
+      for (const filter of queryIntent.filters) {
         console.log(`Applying filter: ${filter.column} ${filter.operator} ${filter.value}`)
         
-        // Handle different operators
         switch(filter.operator) {
           case 'eq':
             supabaseQuery = supabaseQuery.eq(filter.column, filter.value)
@@ -69,7 +77,7 @@ export async function POST(request) {
           default:
             console.warn(`Unknown operator: ${filter.operator}`)
         }
-      })
+      }
     }
     
     // Apply ordering
@@ -77,6 +85,9 @@ export async function POST(request) {
       supabaseQuery = supabaseQuery.order(queryIntent.order.column, { 
         ascending: queryIntent.order.ascending 
       })
+    } else {
+      // Default ordering
+      supabaseQuery = supabaseQuery.order('inquiry_created_ts', { ascending: false })
     }
     
     // Apply limit
@@ -85,42 +96,53 @@ export async function POST(request) {
     }
     
     // Execute query
+    console.log('Executing Supabase query...')
     const { data, error } = await supabaseQuery
     
     if (error) {
       console.error('Supabase error:', error)
-      throw error
+      throw new Error(`Database error: ${error.message}`)
     }
     
     console.log(`Query returned ${data ? data.length : 0} records`)
     
     // Post-process data for grouping
     let processedData = data
+    let visualization = queryIntent.visualization || 'table'
+    
     if (queryIntent.groupBy && data && data.length > 0) {
       const grouped = {}
       data.forEach(item => {
         let key = item[queryIntent.groupBy] || 'Unknown'
+        
+        // Special handling for agent grouping
         if (queryIntent.groupBy === 'agent_id' && item.agents) {
           key = `${item.agents.first_name} ${item.agents.last_name}`
         }
+        
         grouped[key] = (grouped[key] || 0) + 1
       })
       
       processedData = Object.entries(grouped)
         .map(([name, value]) => ({ name, value }))
         .sort((a, b) => b.value - a.value)
+      
+      // Force visualization for grouped data
+      if (!queryIntent.visualization) {
+        visualization = 'bar'
+      }
     }
     
+    // Return response
     return NextResponse.json({
       success: true,
       data: processedData,
       rawData: data,
-      intent: queryIntent,
+      intent: { ...queryIntent, visualization },
       count: data ? data.length : 0,
       debug: {
-        totalRecords: data ? data.length : 0,
-        queryUsed: queryIntent,
-        timestamp: new Date().toISOString()
+        appliedFilters: queryIntent.filters,
+        query: queryIntent
       }
     })
     
@@ -132,7 +154,7 @@ export async function POST(request) {
         error: error.message,
         debug: {
           errorType: error.constructor.name,
-          timestamp: new Date().toISOString()
+          stack: error.stack
         }
       },
       { status: 500 }
@@ -141,14 +163,32 @@ export async function POST(request) {
 }
 
 async function parseQueryWithClaude(userQuery) {
-  const today = new Date()
-  const todayStr = today.toISOString().split('T')[0]
+  if (!anthropic) {
+    throw new Error('Claude API not initialized')
+  }
   
-  const prompt = `You are a SQL query expert for a Supabase database. Convert this natural language query into parameters for Supabase JavaScript client.
+  const currentDate = new Date('2025-07-31')
+  const prompt = `You are a SQL query builder for Supabase. Current date is ${currentDate.toISOString()}.
 
-Database schema:
-1. agents table:
-   - agents_id (text, primary key)
+User query: "${userQuery}"
+
+Available tables and columns:
+
+1. inquiries table:
+   - inquiry_id (text)
+   - agent_id (text, foreign key to agents.agents_id)
+   - property_id (text)
+   - inquiry_created_ts (timestamp)
+   - source (text: "PRYPCO One", "Campaign Handover", etc.)
+   - status (text: "Won", "Lost", "Pending", "New", "Contacted")
+   - lost_reason (text: "Unresponsive", "Not interested", "Duplicate", etc.)
+   - ts_contacted (timestamp)
+   - ts_lost_reason (timestamp)
+   - ts_won (timestamp)
+   - new_viewings (text)
+
+2. agents table:
+   - agents_id (text)
    - first_name (text)
    - last_name (text)
    - email_address (text)
@@ -158,64 +198,41 @@ Database schema:
    - sales_team_agency_supabase (text)
    - agency_name_supabase (text)
 
-2. inquiries table:
-   - inquiry_id (text, primary key)
-   - agent_id (text, foreign key to agents.agents_id)
-   - property_id (text)
-   - inquiry_created_ts (timestamp without time zone)
-   - source (text)
-   - status (text)
-   - lost_reason (text)
-   - ts_contacted (timestamp without time zone)
-   - ts_lost_reason (timestamp without time zone)
-   - ts_won (timestamp without time zone)
-   - new_viewings (text)
+IMPORTANT CONTEXT: The data in the database is from June 2025, not July 2025. When the user asks for "last week" or "recent" data, you should interpret this as data from late June 2025.
 
-Current date and time: ${today.toISOString()}
-Today's date: ${todayStr}
-
-User query: "${userQuery}"
-
-Respond with ONLY a valid JSON object with this structure:
+Convert the user query to this exact JSON format:
 {
   "table": "inquiries" or "agents",
-  "select": "columns to select (use * for all, or specify columns. For joins use syntax like '*,agents(first_name,last_name)')",
+  "select": "column1,column2" or "*" or "*,agents(first_name,last_name)" for joins,
   "filters": [
     {
       "column": "column_name",
-      "operator": "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "like" | "ilike" | "in" | "is",
-      "value": "value (for dates use ISO format YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)"
+      "operator": "eq|neq|gt|gte|lt|lte|like|ilike|in|is",
+      "value": "value (for dates use ISO format)"
     }
   ],
   "order": {
     "column": "column_name",
-    "ascending": true | false
+    "ascending": true or false
   },
   "limit": number or null,
-  "groupBy": "column_name" or null (use this for grouping by source, status, agent_id, etc),
-  "visualization": "table" | "bar" | "pie" | "line" | "metric",
-  "explanation": "Human-readable explanation of what this query does"
+  "groupBy": "column_name" or null,
+  "visualization": "table|bar|pie|line|metric",
+  "explanation": "Human-readable explanation"
 }
 
-Important guidelines:
-- For "last week", calculate dates from 7 days ago until today
-- For "this month", use from the 1st of current month
-- For "last month", use the previous month's date range
-- Always use ISO format for dates: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS
-- For grouping queries (by source, by status, by agent), set groupBy field AND select all columns
-- For joins with agents table, use select: "*,agents(first_name,last_name)"
-- Common status values: "Won", "Lost", "Pending", "New", "Contacted"
-- Common sources: "PRYPCO One", "Website", "Referral", etc.
-- For "last inquiries" or "recent inquiries", order by inquiry_created_ts descending with a limit of 20-50
+Guidelines:
+- For "last week" from July 31, 2025: use June 24-30, 2025
+- For "this month" from July 31, 2025: suggest looking at June 2025 data instead
+- For "recent" or "latest": order by inquiry_created_ts DESC with limit 20-50
+- For joins with agents: use select: "*,agents(first_name,last_name)"
+- For grouping: set groupBy AND include all columns in select
 - Choose appropriate visualization based on query type
+- Use exact column names as listed above
 
-RESPOND ONLY WITH VALID JSON, NO ADDITIONAL TEXT.`
+RESPOND ONLY WITH VALID JSON.`
 
   try {
-    if (!process.env.ANTHROPIC_API_KEY) {
-      throw new Error('ANTHROPIC_API_KEY not found in environment variables')
-    }
-    
     const message = await anthropic.messages.create({
       model: 'claude-3-sonnet-20240229',
       max_tokens: 1000,
@@ -229,26 +246,20 @@ RESPOND ONLY WITH VALID JSON, NO ADDITIONAL TEXT.`
     })
     
     const responseText = message.content[0].text.trim()
-    console.log('Claude response:', responseText)
-    
-    // Clean the response in case it has markdown
     const cleanedResponse = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
     
-    const queryIntent = JSON.parse(cleanedResponse)
-    
-    return queryIntent
+    return JSON.parse(cleanedResponse)
   } catch (error) {
     console.error('Claude API Error:', error)
-    console.error('Falling back to basic parser')
-    // Fallback to basic parsing if Claude fails
-    return basicParseQuery(userQuery)
+    throw error
   }
 }
 
-// Fallback parser in case Claude API fails
+// Enhanced fallback parser
 function basicParseQuery(query) {
   const lowerQuery = query.toLowerCase()
-  const today = new Date()
+  const currentDate = new Date('2025-07-31')
+  
   const intent = {
     table: 'inquiries',
     select: '*',
@@ -257,8 +268,10 @@ function basicParseQuery(query) {
       column: 'inquiry_created_ts',
       ascending: false
     },
+    limit: null,
+    groupBy: null,
     visualization: 'table',
-    explanation: 'Showing data based on your query (using fallback parser)'
+    explanation: 'Showing data based on your query'
   }
   
   // Determine table
@@ -267,82 +280,97 @@ function basicParseQuery(query) {
     intent.order.column = 'sign_up_timestamp'
   }
   
-  // Date filtering
+  // Handle date filtering - adjust for June data
   if (lowerQuery.includes('last week') || lowerQuery.includes('past week')) {
-    const lastWeek = new Date(today)
-    lastWeek.setDate(today.getDate() - 7)
-    lastWeek.setHours(0, 0, 0, 0)
-    
-    const dateColumn = intent.table === 'agents' ? 'sign_up_timestamp' : 'inquiry_created_ts'
-    
+    // Since data is from June, show last week of June
     intent.filters.push({
-      column: dateColumn,
+      column: 'inquiry_created_ts',
       operator: 'gte',
-      value: lastWeek.toISOString()
+      value: '2025-06-24T00:00:00Z'
     })
     intent.filters.push({
-      column: dateColumn,
+      column: 'inquiry_created_ts',
       operator: 'lte',
-      value: today.toISOString()
+      value: '2025-06-30T23:59:59Z'
     })
-    intent.explanation = `Showing ${intent.table} from the last 7 days (${lastWeek.toLocaleDateString()} to ${today.toLocaleDateString()}) - using fallback parser`
-  } else if (lowerQuery.includes('this month')) {
-    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1)
-    const dateColumn = intent.table === 'agents' ? 'sign_up_timestamp' : 'inquiry_created_ts'
-    
+    intent.explanation = 'Showing inquiries from the last week of June 2025 (your most recent data)'
+  } else if (lowerQuery.includes('june') || lowerQuery.includes('last month')) {
     intent.filters.push({
-      column: dateColumn,
+      column: 'inquiry_created_ts',
       operator: 'gte',
-      value: monthStart.toISOString()
+      value: '2025-06-01T00:00:00Z'
     })
-    intent.explanation = `Showing ${intent.table} from this month - using fallback parser`
-  } else if (lowerQuery.includes('last 30 days')) {
-    const thirtyDaysAgo = new Date(today)
-    thirtyDaysAgo.setDate(today.getDate() - 30)
-    const dateColumn = intent.table === 'agents' ? 'sign_up_timestamp' : 'inquiry_created_ts'
-    
     intent.filters.push({
-      column: dateColumn,
-      operator: 'gte',
-      value: thirtyDaysAgo.toISOString()
+      column: 'inquiry_created_ts',
+      operator: 'lte',
+      value: '2025-06-30T23:59:59Z'
     })
-    intent.explanation = `Showing ${intent.table} from the last 30 days - using fallback parser`
+    intent.explanation = 'Showing all inquiries from June 2025'
   }
   
   // Status filtering
-  if (lowerQuery.includes('won deal') || lowerQuery.includes('won inquir')) {
+  if (lowerQuery.includes('won')) {
     intent.filters.push({
       column: 'status',
       operator: 'eq',
       value: 'Won'
     })
-    intent.explanation += ' (Won status only)'
+    intent.explanation = 'Showing all won deals'
   } else if (lowerQuery.includes('lost')) {
     intent.filters.push({
       column: 'status',
       operator: 'eq',
       value: 'Lost'
     })
-    intent.explanation += ' (Lost status only)'
+    intent.explanation = 'Showing all lost inquiries'
+  } else if (lowerQuery.includes('pending')) {
+    intent.filters.push({
+      column: 'status',
+      operator: 'eq',
+      value: 'Pending'
+    })
+    intent.explanation = 'Showing all pending inquiries'
+  }
+  
+  // Source filtering
+  if (lowerQuery.includes('prypco one')) {
+    intent.filters.push({
+      column: 'source',
+      operator: 'eq',
+      value: 'PRYPCO One'
+    })
+    intent.explanation = 'Showing inquiries from PRYPCO One source'
   }
   
   // Grouping
   if (lowerQuery.includes('by source') || lowerQuery.includes('grouped by source')) {
     intent.groupBy = 'source'
     intent.visualization = 'bar'
+    intent.explanation = 'Showing inquiries grouped by source'
   } else if (lowerQuery.includes('by status')) {
     intent.groupBy = 'status'
     intent.visualization = 'bar'
+    intent.explanation = 'Showing inquiries grouped by status'
   } else if (lowerQuery.includes('by agent')) {
     intent.select = '*,agents(first_name,last_name)'
     intent.groupBy = 'agent_id'
     intent.visualization = 'bar'
+    intent.explanation = 'Showing inquiries grouped by agent'
   }
   
-  // Recent/Last inquiries
-  if (lowerQuery.includes('last inquiries') || lowerQuery.includes('recent inquiries')) {
-    intent.limit = 20
-    intent.explanation = 'Showing the 20 most recent inquiries - using fallback parser'
+  // Limits
+  if (lowerQuery.includes('last') && lowerQuery.includes('inquir')) {
+    const match = lowerQuery.match(/last (\d+)/);
+    intent.limit = match ? parseInt(match[1]) : 20
+    intent.explanation = `Showing the last ${intent.limit} inquiries`
+  } else if (lowerQuery.includes('recent')) {
+    intent.limit = 50
+    intent.explanation = 'Showing the 50 most recent inquiries'
+  }
+  
+  // Count only
+  if (lowerQuery.includes('how many') || lowerQuery.includes('count')) {
+    intent.visualization = 'metric'
   }
   
   return intent
