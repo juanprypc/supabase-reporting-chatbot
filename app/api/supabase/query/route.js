@@ -76,26 +76,33 @@ COMMON QUERY EXAMPLES:
 1. "Which agents closed the most won deals this month?"
    → SELECT with JOIN, WHERE status='Won' AND ts_won >= DATE_TRUNC('month', CURRENT_DATE)
 
-2. "Show rolling 7-day win rate trend"
-   → Use window functions: SUM() OVER(ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)
+2. "Show rolling 7-day win rate trend" (for last 30 days)
+   → WITH daily_data AS (SELECT DATE(inquiry_created_ts) as day, status FROM inquiries WHERE inquiry_created_ts >= CURRENT_DATE - INTERVAL '30 days')
+     Then use window functions on the aggregated daily data
 
-3. "Inquiries from July" or "July 2025"
-   → WHERE inquiry_created_ts BETWEEN '2025-07-01' AND '2025-07-31'
+3. "Inquiries from July" (assumes current year unless specified)
+   → WHERE inquiry_created_ts >= DATE_TRUNC('month', CONCAT(EXTRACT(YEAR FROM CURRENT_DATE)::text, '-07-01')::date)
+     AND inquiry_created_ts < DATE_TRUNC('month', CONCAT(EXTRACT(YEAR FROM CURRENT_DATE)::text, '-07-01')::date) + INTERVAL '1 month'
 
-4. "Today's inquiries"
-   → WHERE DATE(inquiry_created_ts) = CURRENT_DATE
+4. "This month" vs "Last month"
+   → This month: WHERE inquiry_created_ts >= DATE_TRUNC('month', CURRENT_DATE)
+   → Last month: WHERE inquiry_created_ts >= DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') 
+                 AND inquiry_created_ts < DATE_TRUNC('month', CURRENT_DATE)
 
-5. "Average time to contact"
-   → EXTRACT(EPOCH FROM (ts_contacted - inquiry_created_ts)) / 3600 AS hours
+5. "How many viewings this month?"
+   → For counting comma-separated values: 
+     SELECT SUM(CASE WHEN new_viewings IS NOT NULL AND new_viewings != '' 
+                     THEN array_length(string_to_array(new_viewings, ','), 1) 
+                     ELSE 0 END) as total_viewings
 
 6. "Win rate by source/agent/team"
    → COUNT(*) FILTER (WHERE status='Won')::numeric / NULLIF(COUNT(*),0) AS win_rate
 
-7. "Agents with zero inquiries"
-   → Use LEFT JOIN with WHERE i.inquiry_id IS NULL
+7. "Property with most inquiries"
+   → GROUP BY property_id, ORDER BY COUNT(*) DESC LIMIT 1
 
-8. "Last 30 days", "past week", "this quarter"
-   → CURRENT_DATE - INTERVAL '30 days', '7 days', DATE_TRUNC('quarter', CURRENT_DATE)
+8. Follow-up queries like "and this month?" or "from the previous list"
+   → Return clear error message explaining the query needs to be self-contained
 
 Rules:
 • Builder mode ONLY when: single table, no join, no window, ≤1 groupBy.
@@ -107,19 +114,37 @@ Rules:
 
 /* ---------- 2. Helpers ---------- */
 async function gptAnalyse(question) {
-  const { choices } = await openai.chat.completions.create({
-    model: 'gpt-4o',  // Using gpt-4o for better SQL generation
-    temperature: 0,
-    max_tokens: 1500,  // Increased for complex queries
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user',   content: question }
-    ]
-  });
-  return JSON.parse(
-    choices[0].message.content.trim()
-      .replace(/^```json\s*/i, '').replace(/```$/i, '')
-  );
+  try {
+    const { choices } = await openai.chat.completions.create({
+      model: 'gpt-4o',  // Using gpt-4o for better SQL generation
+      temperature: 0,
+      max_tokens: 1500,  // Increased for complex queries
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: question }
+      ]
+    });
+    
+    const content = choices[0].message.content.trim()
+      .replace(/^```json\s*/i, '').replace(/```$/i, '');
+    
+    // Handle cases where GPT returns explanation instead of JSON
+    if (!content.startsWith('{')) {
+      // If it's a follow-up query that can't be handled
+      if (content.toLowerCase().includes('previous') || content.toLowerCase().includes('follow-up')) {
+        return {
+          mode: 'error',
+          error: 'Please provide a complete query. I cannot reference previous results.'
+        };
+      }
+      throw new Error('Invalid response format from AI');
+    }
+    
+    return JSON.parse(content);
+  } catch (error) {
+    console.error('GPT Analysis Error:', error);
+    throw new Error('Failed to analyze query: ' + error.message);
+  }
 }
 
 function applyFilters(sbq, filters = []) {
@@ -153,6 +178,11 @@ export async function POST(req) {
       : query;
 
     const intent = await gptAnalyse(enriched);
+
+    /* ----------  Error handling  ---------- */
+    if (intent.mode === 'error') {
+      return NextResponse.json({ success: false, error: intent.error }, { status: 400 });
+    }
 
     /* ----------  Builder path  ---------- */
     if (intent.mode === 'builder') {
