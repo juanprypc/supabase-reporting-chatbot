@@ -11,7 +11,7 @@ export default function ChatInterface() {
       id: 1,
       sender: 'bot',
       text:
-        "Hi! I'm your GPT‑4‑powered reporting assistant connected to Supabase.\n\n" +
+        "Hi! I'm your GPT‑4o‑powered reporting assistant connected to Supabase.\n\n" +
         "You can ask natural‑language questions and even advanced data‑science queries " +
         "using window functions, joins, CTEs, etc.\n\n" +
         "Tip ▶   To inject variables, add a line such as  <PROPERTY_ID>=PROP‑25‑00813  " +
