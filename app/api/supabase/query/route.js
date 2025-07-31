@@ -1,377 +1,145 @@
-import { NextResponse } from 'next/server'
-import { supabase } from '@/lib/supabase'
-import Anthropic from '@anthropic-ai/sdk'
+import { NextResponse } from 'next/server';
+import { supabase } from '@/lib/supabase';
+import { pgPool } from '@/lib/db';
+import OpenAI from 'openai';
 
-// Initialize Claude with proper error handling
-let anthropic = null
-if (process.env.ANTHROPIC_API_KEY) {
-  anthropic = new Anthropic({
-    apiKey: process.env.ANTHROPIC_API_KEY,
-  })
-}
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-export async function POST(request) {
-  try {
-    const { query } = await request.json()
-    
-    console.log('Received query:', query)
-    
-    // Parse the query
-    let queryIntent
-    try {
-      queryIntent = await parseQueryWithClaude(query)
-      console.log('Claude parsed query:', JSON.stringify(queryIntent, null, 2))
-    } catch (error) {
-      console.error('Claude parsing failed, using fallback:', error.message)
-      queryIntent = basicParseQuery(query)
-      console.log('Fallback parsed query:', JSON.stringify(queryIntent, null, 2))
-    }
-    
-    // Build Supabase query
-    let supabaseQuery = supabase.from(queryIntent.table)
-    
-    // Apply select
-    if (queryIntent.select) {
-      supabaseQuery = supabaseQuery.select(queryIntent.select)
-    } else {
-      // Default select all
-      supabaseQuery = supabaseQuery.select('*')
-    }
-    
-    // Apply filters
-    if (queryIntent.filters && queryIntent.filters.length > 0) {
-      for (const filter of queryIntent.filters) {
-        console.log(`Applying filter: ${filter.column} ${filter.operator} ${filter.value}`)
-        
-        switch(filter.operator) {
-          case 'eq':
-            supabaseQuery = supabaseQuery.eq(filter.column, filter.value)
-            break
-          case 'neq':
-            supabaseQuery = supabaseQuery.neq(filter.column, filter.value)
-            break
-          case 'gt':
-            supabaseQuery = supabaseQuery.gt(filter.column, filter.value)
-            break
-          case 'gte':
-            supabaseQuery = supabaseQuery.gte(filter.column, filter.value)
-            break
-          case 'lt':
-            supabaseQuery = supabaseQuery.lt(filter.column, filter.value)
-            break
-          case 'lte':
-            supabaseQuery = supabaseQuery.lte(filter.column, filter.value)
-            break
-          case 'like':
-            supabaseQuery = supabaseQuery.like(filter.column, filter.value)
-            break
-          case 'ilike':
-            supabaseQuery = supabaseQuery.ilike(filter.column, filter.value)
-            break
-          case 'in':
-            supabaseQuery = supabaseQuery.in(filter.column, filter.value)
-            break
-          case 'is':
-            supabaseQuery = supabaseQuery.is(filter.column, filter.value)
-            break
-          default:
-            console.warn(`Unknown operator: ${filter.operator}`)
-        }
-      }
-    }
-    
-    // Apply ordering
-    if (queryIntent.order) {
-      supabaseQuery = supabaseQuery.order(queryIntent.order.column, { 
-        ascending: queryIntent.order.ascending 
-      })
-    } else {
-      // Default ordering
-      supabaseQuery = supabaseQuery.order('inquiry_created_ts', { ascending: false })
-    }
-    
-    // Apply limit
-    if (queryIntent.limit) {
-      supabaseQuery = supabaseQuery.limit(queryIntent.limit)
-    }
-    
-    // Execute query
-    console.log('Executing Supabase query...')
-    const { data, error } = await supabaseQuery
-    
-    if (error) {
-      console.error('Supabase error:', error)
-      throw new Error(`Database error: ${error.message}`)
-    }
-    
-    console.log(`Query returned ${data ? data.length : 0} records`)
-    
-    // Post-process data for grouping
-    let processedData = data
-    let visualization = queryIntent.visualization || 'table'
-    
-    if (queryIntent.groupBy && data && data.length > 0) {
-      const grouped = {}
-      data.forEach(item => {
-        let key = item[queryIntent.groupBy] || 'Unknown'
-        
-        // Special handling for agent grouping
-        if (queryIntent.groupBy === 'agent_id' && item.agents) {
-          key = `${item.agents.first_name} ${item.agents.last_name}`
-        }
-        
-        grouped[key] = (grouped[key] || 0) + 1
-      })
-      
-      processedData = Object.entries(grouped)
-        .map(([name, value]) => ({ name, value }))
-        .sort((a, b) => b.value - a.value)
-      
-      // Force visualization for grouped data
-      if (!queryIntent.visualization) {
-        visualization = 'bar'
-      }
-    }
-    
-    // Return response
-    return NextResponse.json({
-      success: true,
-      data: processedData,
-      rawData: data,
-      intent: { ...queryIntent, visualization },
-      count: data ? data.length : 0,
-      debug: {
-        appliedFilters: queryIntent.filters,
-        query: queryIntent
-      }
-    })
-    
-  } catch (error) {
-    console.error('API Error:', error)
-    return NextResponse.json(
-      { 
-        success: false, 
-        error: error.message,
-        debug: {
-          errorType: error.constructor.name,
-          stack: error.stack
-        }
-      },
-      { status: 500 }
-    )
-  }
-}
+/* ---------- 1. GPT‑4 prompt ---------- */
+const systemPrompt = `
+You are a staff data‑scientist with full SQL access to two tables
+(agents, inquiries).  Users may also supply “parameters” e.g.
+   <PROPERTY_ID>=PROP-25-00111
+Use them to replace placeholders in the query.
 
-async function parseQueryWithClaude(userQuery) {
-  if (!anthropic) {
-    throw new Error('Claude API not initialized')
-  }
-  
-  const currentDate = new Date('2025-07-31')
-  const prompt = `You are a SQL query builder for Supabase. Current date is ${currentDate.toISOString()}.
+Return **valid JSON only** in one of two shapes:
 
-User query: "${userQuery}"
-
-Available tables and columns:
-
-1. inquiries table:
-   - inquiry_id (text)
-   - agent_id (text, foreign key to agents.agents_id)
-   - property_id (text)
-   - inquiry_created_ts (timestamp)
-   - source (text: "PRYPCO One", "Campaign Handover", etc.)
-   - status (text: "Won", "Lost", "Pending", "New", "Contacted")
-   - lost_reason (text: "Unresponsive", "Not interested", "Duplicate", etc.)
-   - ts_contacted (timestamp)
-   - ts_lost_reason (timestamp)
-   - ts_won (timestamp)
-   - new_viewings (text)
-
-2. agents table:
-   - agents_id (text)
-   - first_name (text)
-   - last_name (text)
-   - email_address (text)
-   - whatsapp_number_supabase (text)
-   - years_of_experience (integer)
-   - sign_up_timestamp (date)
-   - sales_team_agency_supabase (text)
-   - agency_name_supabase (text)
-
-IMPORTANT CONTEXT: The data in the database is from June 2025, not July 2025. When the user asks for "last week" or "recent" data, you should interpret this as data from late June 2025.
-
-Convert the user query to this exact JSON format:
+### Builder mode  (simple)
 {
-  "table": "inquiries" or "agents",
-  "select": "column1,column2" or "*" or "*,agents(first_name,last_name)" for joins,
-  "filters": [
-    {
-      "column": "column_name",
-      "operator": "eq|neq|gt|gte|lt|lte|like|ilike|in|is",
-      "value": "value (for dates use ISO format)"
+  "mode":"builder",
+  "table":"agents"|"inquiries",
+  "select":"* | column list | aggregates",
+  "filters":[{ "column":"", "operator":"", "value":"" }],
+  "groupBy": null | "col",
+  "order": null | { "column":"", "ascending":true|false },
+  "limit": null | 100,
+  "visualization":"table"|"bar"|"pie"|"line"|"metric",
+  "explanation":"text"
+}
+
+### SQL mode  (advanced)
+{
+  "mode":"sql",
+  "sql":"WITH ... SELECT ...",           // runnable Postgres SQL
+  "visualization":"table"|"bar"|"pie"|"line"|"metric"|"histogram"|"pivot",
+  "explanation":"text",
+  "labels": { "x":"", "y":"" }          // optional axis / legend labels
+}
+
+Rules:
+• Builder mode ONLY when: single table, no join, no window, ≤1 groupBy.
+• Otherwise choose SQL mode.
+• Always append “LIMIT 10000” to SQL if user didn’t request a limit.
+• Never output INSERT/UPDATE/DELETE/CREATE/ALTER statements – read‑only.
+• Never wrap JSON in markdown fences.
+`;
+
+/* ---------- 2. Helpers ---------- */
+async function gptAnalyse(question) {
+  const { choices } = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    temperature: 0,
+    max_tokens: 900,
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user',   content: question }
+    ]
+  });
+  return JSON.parse(
+    choices[0].message.content.trim()
+      .replace(/^```json\s*/i, '').replace(/```$/i, '')
+  );
+}
+
+function applyFilters(sbq, filters = []) {
+  return filters.reduce((q, f) => {
+    const ops = {
+      eq: 'eq', neq: 'neq', gt: 'gt', gte: 'gte',
+      lt: 'lt', lte: 'lte', like: 'like', ilike: 'ilike',
+      in: 'in', is: 'is', contains: 'contains', containedBy: 'containedBy',
+    };
+    if (f.operator === 'between') {
+      return q.gte(f.column, f.value[0]).lte(f.column, f.value[1]);
     }
-  ],
-  "order": {
-    "column": "column_name",
-    "ascending": true or false
-  },
-  "limit": number or null,
-  "groupBy": "column_name" or null,
-  "visualization": "table|bar|pie|line|metric",
-  "explanation": "Human-readable explanation"
+    if (f.operator === 'or') return q.or(f.value);        // "status.eq.Won,status.eq.Lost"
+    if (!ops[f.operator]) throw Error(`Unsupported op ${f.operator}`);
+    return q[ops[f.operator]](f.column, f.value);
+  }, sbq);
 }
 
-Guidelines:
-- For "last week" from July 31, 2025: use June 24-30, 2025
-- For "this month" from July 31, 2025: suggest looking at June 2025 data instead
-- For "recent" or "latest": order by inquiry_created_ts DESC with limit 20-50
-- For joins with agents: use select: "*,agents(first_name,last_name)"
-- For grouping: set groupBy AND include all columns in select
-- Choose appropriate visualization based on query type
-- Use exact column names as listed above
+function sqlIsSafe(sql) {
+  return !/;\s*(insert|update|delete|create|alter|drop)\b/i.test(sql);
+}
 
-RESPOND ONLY WITH VALID JSON.`
-
+/* ---------- 3. Handler ---------- */
+export async function POST(req) {
   try {
-    const message = await anthropic.messages.create({
-      model: 'claude-opus-4-20250514',
-      max_tokens: 1000,
-      temperature: 0,
-      messages: [
-        {
-          role: 'user',
-          content: prompt
-        }
-      ]
-    })
-    
-    const responseText = message.content[0].text.trim()
-    const cleanedResponse = responseText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
-    
-    return JSON.parse(cleanedResponse)
-  } catch (error) {
-    console.error('Claude API Error:', error)
-    throw error
-  }
-}
+    const { query, parameters = '' } = await req.json();   // parameters optional
 
-// Enhanced fallback parser
-function basicParseQuery(query) {
-  const lowerQuery = query.toLowerCase()
-  const currentDate = new Date('2025-07-31')
-  
-  const intent = {
-    table: 'inquiries',
-    select: '*',
-    filters: [],
-    order: {
-      column: 'inquiry_created_ts',
-      ascending: false
-    },
-    limit: null,
-    groupBy: null,
-    visualization: 'table',
-    explanation: 'Showing data based on your query'
+    /* -- 3.1 replace <PLACEHOLDERS>=value in the user string for GPT’s context -- */
+    const enriched = parameters
+      ? `${parameters}\n\n${query}`
+      : query;
+
+    const intent = await gptAnalyse(enriched);
+
+    /* ----------  Builder path  ---------- */
+    if (intent.mode === 'builder') {
+      let sbq = supabase.from(intent.table).select(intent.select);
+
+      sbq = applyFilters(sbq, intent.filters);
+      if (intent.order) sbq = sbq.order(intent.order.column, { ascending: intent.order.ascending });
+      if (intent.limit) sbq = sbq.limit(intent.limit);
+
+      const { data: rows, error } = await sbq;
+      if (error) throw error;
+
+      let data = rows;
+      if (intent.groupBy) {
+        const grouped = {};
+        rows.forEach(r => {
+          const key = r[intent.groupBy] ?? 'Unknown';
+          grouped[key] = (grouped[key] || 0) + 1;
+        });
+        data = Object.entries(grouped).map(([name, value]) => ({ name, value }));
+      }
+
+      return NextResponse.json({ success: true, count: rows.length, data, rawData: rows, intent });
+    }
+
+    /* ----------  SQL path  ---------- */
+    if (intent.mode === 'sql') {
+      if (!sqlIsSafe(intent.sql)) throw Error('Only read‑only SQL is permitted');
+
+      // guarantee LIMIT 10000 unless user already put a limit
+      const sqlFinal = /limit\s+\d+/i.test(intent.sql)
+        ? intent.sql
+        : `${intent.sql.trim().replace(/;$/, '')} LIMIT 10000`;
+
+      const { rows } = await pgPool.query(sqlFinal);
+
+      return NextResponse.json({
+        success: true,
+        count: rows.length,
+        data: rows,
+        rawData: rows,
+        intent,
+      });
+    }
+
+    throw Error('intent.mode must be "builder" or "sql"');
+  } catch (err) {
+    console.error(err);
+    return NextResponse.json({ success: false, error: err.message }, { status: 500 });
   }
-  
-  // Determine table
-  if (lowerQuery.includes('agent') && !lowerQuery.includes('inquir') && !lowerQuery.includes('by agent')) {
-    intent.table = 'agents'
-    intent.order.column = 'sign_up_timestamp'
-  }
-  
-  // Handle date filtering - adjust for June data
-  if (lowerQuery.includes('last week') || lowerQuery.includes('past week')) {
-    // Since data is from June, show last week of June
-    intent.filters.push({
-      column: 'inquiry_created_ts',
-      operator: 'gte',
-      value: '2025-06-24T00:00:00Z'
-    })
-    intent.filters.push({
-      column: 'inquiry_created_ts',
-      operator: 'lte',
-      value: '2025-06-30T23:59:59Z'
-    })
-    intent.explanation = 'Showing inquiries from the last week of June 2025 (your most recent data)'
-  } else if (lowerQuery.includes('june') || lowerQuery.includes('last month')) {
-    intent.filters.push({
-      column: 'inquiry_created_ts',
-      operator: 'gte',
-      value: '2025-06-01T00:00:00Z'
-    })
-    intent.filters.push({
-      column: 'inquiry_created_ts',
-      operator: 'lte',
-      value: '2025-06-30T23:59:59Z'
-    })
-    intent.explanation = 'Showing all inquiries from June 2025'
-  }
-  
-  // Status filtering
-  if (lowerQuery.includes('won')) {
-    intent.filters.push({
-      column: 'status',
-      operator: 'eq',
-      value: 'Won'
-    })
-    intent.explanation = 'Showing all won deals'
-  } else if (lowerQuery.includes('lost')) {
-    intent.filters.push({
-      column: 'status',
-      operator: 'eq',
-      value: 'Lost'
-    })
-    intent.explanation = 'Showing all lost inquiries'
-  } else if (lowerQuery.includes('pending')) {
-    intent.filters.push({
-      column: 'status',
-      operator: 'eq',
-      value: 'Pending'
-    })
-    intent.explanation = 'Showing all pending inquiries'
-  }
-  
-  // Source filtering
-  if (lowerQuery.includes('prypco one')) {
-    intent.filters.push({
-      column: 'source',
-      operator: 'eq',
-      value: 'PRYPCO One'
-    })
-    intent.explanation = 'Showing inquiries from PRYPCO One source'
-  }
-  
-  // Grouping
-  if (lowerQuery.includes('by source') || lowerQuery.includes('grouped by source')) {
-    intent.groupBy = 'source'
-    intent.visualization = 'bar'
-    intent.explanation = 'Showing inquiries grouped by source'
-  } else if (lowerQuery.includes('by status')) {
-    intent.groupBy = 'status'
-    intent.visualization = 'bar'
-    intent.explanation = 'Showing inquiries grouped by status'
-  } else if (lowerQuery.includes('by agent')) {
-    intent.select = '*,agents(first_name,last_name)'
-    intent.groupBy = 'agent_id'
-    intent.visualization = 'bar'
-    intent.explanation = 'Showing inquiries grouped by agent'
-  }
-  
-  // Limits
-  if (lowerQuery.includes('last') && lowerQuery.includes('inquir')) {
-    const match = lowerQuery.match(/last (\d+)/);
-    intent.limit = match ? parseInt(match[1]) : 20
-    intent.explanation = `Showing the last ${intent.limit} inquiries`
-  } else if (lowerQuery.includes('recent')) {
-    intent.limit = 50
-    intent.explanation = 'Showing the 50 most recent inquiries'
-  }
-  
-  // Count only
-  if (lowerQuery.includes('how many') || lowerQuery.includes('count')) {
-    intent.visualization = 'metric'
-  }
-  
-  return intent
 }
